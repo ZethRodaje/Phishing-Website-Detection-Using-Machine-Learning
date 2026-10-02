@@ -107,6 +107,15 @@ def verdict(p, thr):
     return label, borderline
 
 
+def subdomain_note(X, label):
+    """Warn when a 'Phishing' result may come from the subdomain, which the training data barely covers."""
+    if label == "Phishing" and X["subdomain_count"].iloc[0] >= 1 and X["has_ip"].iloc[0] == 0:
+        return ("This host has a subdomain. The training data had very few legitimate hosts with "
+                "subdomains, so this model tends to over-flag them. Check the site's main domain "
+                "before deciding.")
+    return ""
+
+
 # ---- UI ----
 st.set_page_config(page_title="Phishing Website Detector", page_icon="🛡️")
 st.title("Phishing Website Detector")
@@ -148,6 +157,9 @@ with tab_single:
             c2.metric("Threshold", f"{thr:.0%}")
             if borderline:
                 st.warning("This score is close to the threshold, so treat the result with caution.")
+            note = subdomain_note(X, label)
+            if note:
+                st.info(note)
             if "." not in host:
                 st.info("This host has no dot (no domain extension), so the model is not reliable for it.")
             st.write(f"Host analysed: `{host}`")
@@ -159,16 +171,17 @@ with tab_batch:
     if st.button("Check all") and text.strip():
         rows = []
         for u in [x.strip() for x in text.splitlines() if x.strip()]:
-            host, _, p = score(u, art)
+            host, X, p = score(u, art)
             if not host:
                 rows.append({"input": u, "host": "", "phishing_probability": None,
-                             "prediction": "Invalid input", "borderline": False})
+                             "prediction": "Invalid input", "borderline": False, "note": ""})
                 continue
             label, borderline = verdict(p, thr)
             if label != "Phishing":
                 label = "Not flagged as phishing"
             rows.append({"input": u, "host": host, "phishing_probability": round(p, 4),
-                         "prediction": label, "borderline": borderline})
+                         "prediction": label, "borderline": borderline,
+                         "note": "has subdomain, may be over-flagged" if subdomain_note(X, label) else ""})
         out = pd.DataFrame(rows)
         st.dataframe(out, width="stretch")
         st.download_button("Download CSV", out.to_csv(index=False), "predictions.csv", "text/csv")
