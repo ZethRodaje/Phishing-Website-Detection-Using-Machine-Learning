@@ -35,7 +35,10 @@ def normalize_host(u):
     u = u.strip()
     if "://" not in u:
         u = "http://" + u
-    h = urlparse(u).netloc.split(":")[0].lower()
+    try:
+        h = urlparse(u).netloc.split(":")[0].lower()
+    except ValueError:  # malformed input such as "http://[bad"; treated as "no host found"
+        return ""
     if h.startswith("www.") and h.count(".") >= 2:
         h = h[4:]
     return h
@@ -134,16 +137,22 @@ with tab_single:
     url = st.text_input("URL or domain", value=EXAMPLES[example], placeholder="e.g. example.com/login")
     if st.button("Check URL", type="primary") and url.strip():
         host, X, p = score(url, art)
-        label, borderline = verdict(p, thr)
-        (st.error if label == "Phishing" else st.success)(f"{label}")
-        c1, c2 = st.columns(2)
-        c1.metric("Phishing probability", f"{p:.1%}")
-        c2.metric("Threshold", f"{thr:.0%}")
-        if borderline:
-            st.warning("This score is close to the threshold, so treat the result with caution.")
-        st.write(f"Host analysed: `{host}`")
-        with st.expander("Features used"):
-            st.dataframe(X.T.rename(columns={0: "value"}), width="stretch")
+        if not host:
+            st.warning("Could not read a host name from this input. Try something like example.com.")
+        else:
+            label, borderline = verdict(p, thr)
+            (st.error if label == "Phishing" else st.warning)(
+                label if label == "Phishing" else "Not flagged as phishing")
+            c1, c2 = st.columns(2)
+            c1.metric("Phishing probability", f"{p:.1%}")
+            c2.metric("Threshold", f"{thr:.0%}")
+            if borderline:
+                st.warning("This score is close to the threshold, so treat the result with caution.")
+            if "." not in host:
+                st.info("This host has no dot (no domain extension), so the model is not reliable for it.")
+            st.write(f"Host analysed: `{host}`")
+            with st.expander("Features used"):
+                st.dataframe(X.T.rename(columns={0: "value"}), width="stretch")
 
 with tab_batch:
     text = st.text_area("One URL or domain per line", height=160)
@@ -151,7 +160,13 @@ with tab_batch:
         rows = []
         for u in [x.strip() for x in text.splitlines() if x.strip()]:
             host, _, p = score(u, art)
+            if not host:
+                rows.append({"input": u, "host": "", "phishing_probability": None,
+                             "prediction": "Invalid input", "borderline": False})
+                continue
             label, borderline = verdict(p, thr)
+            if label != "Phishing":
+                label = "Not flagged as phishing"
             rows.append({"input": u, "host": host, "phishing_probability": round(p, 4),
                          "prediction": label, "borderline": borderline})
         out = pd.DataFrame(rows)
