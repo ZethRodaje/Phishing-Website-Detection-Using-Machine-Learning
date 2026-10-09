@@ -116,6 +116,62 @@ def subdomain_note(X, label):
     return ""
 
 
+# ---- "why this result" (what-if explanation) ----
+# Typical legitimate value of each feature (median over the legitimate rows of the dataset).
+LEGIT_REF = {"url_length": 16, "num_dots": 1, "has_ip": 0, "digits_count": 1, "num_hyphens": 0,
+             "subdomain_count": 0, "entropy": 3.455, "num_labels": 2, "longest_label": 12,
+             "longest_digit_run": 1, "digit_ratio": 0.067, "hyphen_ratio": 0.0, "vowel_ratio": 0.375,
+             "has_susp_word": 0}
+# +1: phishing hosts have higher values, -1: lower values (class averages in the dataset)
+DIRECTION = {"url_length": 1, "num_dots": 1, "has_ip": 1, "digits_count": 1, "num_hyphens": 1,
+             "subdomain_count": 1, "entropy": -1, "num_labels": 1, "longest_label": -1,
+             "longest_digit_run": 1, "digit_ratio": 1, "hyphen_ratio": 1, "vowel_ratio": -1,
+             "has_susp_word": 1}
+MIN_EFFECT = 0.02  # ignore signals that change the score by less than 2 percentage points
+
+REASON_TEXT = {
+    "url_length": lambda v, r, t: f"The host is {int(v)} characters long (typical legitimate host: {int(r)})",
+    "num_dots": lambda v, r, t: f"The host has {int(v)} dots (typical: {int(r)})",
+    "has_ip": lambda v, r, t: "The host is an IP address, not a domain name",
+    "digits_count": lambda v, r, t: f"The host has {int(v)} digits (typical: {int(r)})",
+    "num_hyphens": lambda v, r, t: f"The host has {int(v)} hyphens (typical: {int(r)})",
+    "subdomain_count": lambda v, r, t: f"The host has {int(v)} subdomain(s) (typical: {int(r)})",
+    "entropy": lambda v, r, t: f"Low character variety (score {v:.2f}, typical {r:.2f})",
+    "num_labels": lambda v, r, t: f"The host has {int(v)} dot-separated parts (typical: {int(r)})",
+    "longest_label": lambda v, r, t: f"The longest part is only {int(v)} characters (typical: {int(r)})",
+    "longest_digit_run": lambda v, r, t: f"There is a run of {int(v)} digits in a row (typical: {int(r)})",
+    "digit_ratio": lambda v, r, t: f"{v:.0%} of the host is digits (typical: {r:.0%})",
+    "hyphen_ratio": lambda v, r, t: f"{v:.0%} of the host is hyphens (typical: {r:.0%})",
+    "vowel_ratio": lambda v, r, t: f"Only {v:.0%} of the letters are vowels (typical: {r:.0%})",
+    "has_susp_word": lambda v, r, t: "The host contains a word such as login, secure or verify",
+    "tld_freq": lambda v, r, t: f"The domain ending '.{t}' is not typical of legitimate hosts",
+}
+
+
+def explain(X, art, p, tld, top=3):
+    """Which features push this host toward phishing. Start from a host where every feature has a
+    typical legitimate value, then change one feature at a time to this host's value and see how much
+    the phishing score rises. Returns [(text, rise), ...], biggest first."""
+    ref = dict(LEGIT_REF)
+    ref["tld_freq"] = art["tld_freq_map"].get("com", 0.0)  # .com is the most common legitimate ending
+    def moves_toward_phishing(c):
+        v = float(X[c].iloc[0])
+        if c == "tld_freq":
+            return v != ref[c]
+        return (v - ref[c]) * DIRECTION[c] > 0 and abs(v - ref[c]) >= 0.25 * abs(ref[c])
+    cols = [c for c in X.columns if c in ref and moves_toward_phishing(c)]
+    if not cols:
+        return []
+    base = pd.DataFrame([{c: ref[c] for c in X.columns}])[list(X.columns)]
+    variants = pd.concat([base] * (len(cols) + 1), ignore_index=True)
+    for i, c in enumerate(cols):
+        variants.loc[i + 1, c] = X[c].iloc[0]
+    probs = art["model"].predict_proba(variants)[:, 1]
+    found = [(float(probs[i + 1] - probs[0]), c) for i, c in enumerate(cols)]
+    found = sorted([f for f in found if f[0] >= MIN_EFFECT], reverse=True)
+    return [(REASON_TEXT[c](float(X[c].iloc[0]), ref[c], tld), d) for d, c in found[:top]]
+
+
 # ---- UI ----
 st.set_page_config(page_title="Phishing Website Detector", page_icon="🛡️")
 st.title("Phishing Website Detector")
@@ -163,6 +219,18 @@ with tab_single:
             if "." not in host:
                 st.info("This host has no dot (no domain extension), so the model is not reliable for it.")
             st.write(f"Host analysed: `{host}`")
+            why = explain(X, art, p, get_tld(host))
+            with st.expander("Why this result?", expanded=(label == "Phishing")):
+                if why:
+                    st.write("Signals that raised the phishing score:" if label == "Phishing"
+                             else "Signals that look like phishing, but not enough to flag this host:")
+                    for text, _ in why:
+                        st.write(f"- {text}")
+                    st.caption("Estimated by starting from a typical legitimate host and changing one feature "
+                               "at a time to this host's value. Several signals together can matter "
+                               "more than any one alone.")
+                else:
+                    st.write("No strong phishing signals were found in this host name.")
             with st.expander("Features used"):
                 st.dataframe(X.T.rename(columns={0: "value"}), width="stretch")
 
@@ -174,14 +242,16 @@ with tab_batch:
             host, X, p = score(u, art)
             if not host:
                 rows.append({"input": u, "host": "", "phishing_probability": None,
-                             "prediction": "Invalid input", "borderline": False, "note": ""})
+                             "prediction": "Invalid input", "borderline": False, "note": "", "main_reasons": ""})
                 continue
             label, borderline = verdict(p, thr)
             if label != "Phishing":
                 label = "Not flagged as phishing"
             rows.append({"input": u, "host": host, "phishing_probability": round(p, 4),
                          "prediction": label, "borderline": borderline,
-                         "note": "has subdomain, may be over-flagged" if subdomain_note(X, label) else ""})
+                         "note": "has subdomain, may be over-flagged" if subdomain_note(X, label) else "",
+                         "main_reasons": "; ".join(t for t, _ in explain(X, art, p, get_tld(host), top=2))
+                         if label == "Phishing" else ""})
         out = pd.DataFrame(rows)
         st.dataframe(out, width="stretch")
         st.download_button("Download CSV", out.to_csv(index=False), "predictions.csv", "text/csv")
