@@ -1,7 +1,8 @@
 """Phishing Website Detection - Streamlit app.
 
 Loads phishing_model.joblib (saved by section 13 of the notebook) and scores URLs
-using the same host-only features the model was trained on.
+using the same host-only features the model was trained on. Before the model decides, a few rules
+from section 3.7 of the notebook run: trusted-domain list, brand impersonation, institutional endings.
 
 Run:  streamlit run app.py
 """
@@ -18,6 +19,8 @@ MODEL_PATH = Path(__file__).parent / "phishing_model.joblib"
 IP_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
 SUSP_WORDS = ["login", "signin", "secure", "verify", "account", "update", "banking", "confirm",
               "webscr", "password", "support", "billing", "recover", "unlock", "alert", "suspend"]
+LEET = str.maketrans({"0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "@": "a"})
+SECOND_LEVEL = {"co", "com", "org", "net", "gov", "edu", "ac", "or", "ne", "go", "mil"}
 BORDERLINE_MARGIN = 0.15  # flag results this close to the decision threshold
 
 EXAMPLES = {
@@ -51,11 +54,19 @@ def shannon_entropy(s):
     return -sum(p * math.log2(p) for p in probs)
 
 
+def suffix_len(host):
+    """Labels in the public suffix: 2 for endings like co.uk, com.ph, edu.ph, gov.ph; otherwise 1."""
+    parts = host.split(".")
+    return 2 if len(parts) >= 3 and len(parts[-1]) == 2 and parts[-2] in SECOND_LEVEL else 1
+
+
 def get_tld(host):
     if IP_RE.match(host):
         return "ip_address"
     parts = host.split(".")
-    return parts[-1] if len(parts) >= 2 else "unknown"
+    if len(parts) < 2:
+        return "unknown"
+    return ".".join(parts[-suffix_len(host):])
 
 
 def host_features(h):
@@ -73,7 +84,7 @@ def host_features(h):
         "has_ip": int(is_ip),
         "digits_count": n_digits,
         "num_hyphens": n_hyphens,
-        "subdomain_count": 0 if is_ip else max(len(labels) - 2, 0),
+        "subdomain_count": 0 if is_ip else max(len(labels) - 1 - suffix_len(h), 0),
         "entropy": shannon_entropy(h),
         "num_labels": len(labels),
         "longest_label": max(len(x) for x in labels),
@@ -101,10 +112,72 @@ def score(url, art):
     return host, X, p
 
 
-def verdict(p, thr):
-    label = "Phishing" if p >= thr else "Not phishing"
-    borderline = abs(p - thr) <= BORDERLINE_MARGIN
-    return label, borderline
+# ---- rules checked before the model (same logic as section 3.7 of the notebook; data comes from the model file) ----
+def suffix_walk(host):
+    parts = host.split(".")
+    return [".".join(parts[i:]) for i in range(len(parts))]
+
+
+def registered_domain(h):
+    if IP_RE.match(h):
+        return h
+    return ".".join(h.split(".")[-(suffix_len(h) + 1):])
+
+
+def is_trusted(host, art):
+    trusted = set(art["trusted_domains"])
+    return any(s in trusted for s in suffix_walk(host))
+
+
+def is_shared_platform(host, art):
+    shared = set(art["shared_platform_hosts"])
+    return any(s in shared for s in suffix_walk(host))
+
+
+def is_official_for(host, brand, art):
+    if any(s in art["brand_official"][brand] for s in suffix_walk(host)):
+        return True
+    reg = registered_domain(host).split(".")
+    if reg[0] != brand:
+        return False
+    return ".".join(reg[1:]) in {"com", "net", "org"} or (len(reg[-1]) == 2 and reg[-1] not in art["abused_tlds"])
+
+
+def brand_impersonated(host, art):
+    if not host or IP_RE.match(host):
+        return None
+    strong = set(art["strong_brands"])
+    tokens = [t for t in re.split(r"[^a-z0-9@]+", host) if t]
+    variants = tokens + [t.translate(LEET) for t in tokens]
+    for brand in art["brand_official"]:
+        hit = any((brand in t) if brand in strong else (t == brand) for t in variants)
+        if hit and not is_official_for(host, brand, art):
+            return brand
+    return None
+
+
+def rule_verdict(host, art):
+    """(is_phishing, decided_by, reason) when a rule applies, otherwise None so the model decides."""
+    if not host or IP_RE.match(host):
+        return None
+    if is_trusted(host, art):
+        return (False, "trusted domain list", "This is a known legitimate domain.")
+    brand = brand_impersonated(host, art)
+    if brand:
+        return (True, "brand impersonation rule",
+                f"The host uses the name '{brand}' but is not an official {brand} domain.")
+    if re.search(art["institution_pattern"], host):
+        return (False, "institutional domain rule",
+                "The ending (.edu, .gov, .ac, .edu.ph, .gov.ph ...) can only be registered by schools and governments.")
+    return None
+
+
+def decide(host, p, thr, art):
+    """Final decision: rules first, then the model. Returns (is_phishing, decided_by, reason, borderline)."""
+    r = rule_verdict(host, art)
+    if r:
+        return r[0], r[1], r[2], False
+    return p >= thr, "model", "", abs(p - thr) <= BORDERLINE_MARGIN
 
 
 def subdomain_note(X, label):
@@ -148,11 +221,16 @@ REASON_TEXT = {
 }
 
 
+def legit_ref(art):
+    """Median legitimate value per feature, saved with the model; falls back to the constants above."""
+    return {**LEGIT_REF, **art.get("legit_reference", {})}
+
+
 def explain(X, art, p, tld, top=3):
     """Which features push this host toward phishing. Start from a host where every feature has a
     typical legitimate value, then change one feature at a time to this host's value and see how much
     the phishing score rises. Returns [(text, rise), ...], biggest first."""
-    ref = dict(LEGIT_REF)
+    ref = legit_ref(art)
     ref["tld_freq"] = art["tld_freq_map"].get("com", 0.0)  # .com is the most common legitimate ending
     def moves_toward_phishing(c):
         v = float(X[c].iloc[0])
@@ -192,7 +270,8 @@ with st.sidebar:
     st.write("A URL is flagged as phishing when its phishing probability is at or above the threshold.")
     st.subheader("Limits")
     st.write("- Only the host name is used. Path, query and scheme are ignored.")
-    st.write("- Trained on only 820 legitimate domains, so short popular domains can score near the threshold.")
+    st.write("- The model saw few legitimate domains. Known sites, brand look-alikes and .edu/.gov endings are handled by rules; any other site is decided by the model alone.")
+    st.write("- Pages on shared platforms (github.com, docs.google.com) cannot be judged from the host name.")
     st.write("- This is a coursework model. It is not a replacement for browser or security-vendor protection.")
 
 tab_single, tab_batch = st.tabs(["Single URL", "Batch"])
@@ -205,24 +284,36 @@ with tab_single:
         if not host:
             st.warning("Could not read a host name from this input. Try something like example.com.")
         else:
-            label, borderline = verdict(p, thr)
-            (st.error if label == "Phishing" else st.warning)(
-                label if label == "Phishing" else "Not flagged as phishing")
+            is_phish, by, reason, borderline = decide(host, p, thr, art)
+            if is_phish:
+                st.error("Phishing")
+            elif by == "model":
+                st.warning("Not flagged as phishing")
+            else:
+                st.success("Not phishing")
             c1, c2 = st.columns(2)
-            c1.metric("Phishing probability", f"{p:.1%}")
+            c1.metric("Model phishing probability", f"{p:.1%}")
             c2.metric("Threshold", f"{thr:.0%}")
+            if by != "model":
+                st.info(f"Decided by the {by}. {reason} The model score above is shown for reference only.")
             if borderline:
                 st.warning("This score is close to the threshold, so treat the result with caution.")
-            note = subdomain_note(X, label)
+            if not is_phish and is_shared_platform(host, art):
+                st.info("This host is a shared platform where anyone can publish pages. The host name is legitimate, "
+                        "but a specific page on it can still be malicious, so check the full link.")
+            label = "Phishing" if is_phish else "Not phishing"
+            note = subdomain_note(X, label) if by == "model" else ""
             if note:
                 st.info(note)
             if "." not in host:
                 st.info("This host has no dot (no domain extension), so the model is not reliable for it.")
             st.write(f"Host analysed: `{host}`")
-            why = explain(X, art, p, get_tld(host))
-            with st.expander("Why this result?", expanded=(label == "Phishing")):
-                if why:
-                    st.write("Signals that raised the phishing score:" if label == "Phishing"
+            why = explain(X, art, p, get_tld(host)) if by == "model" else []
+            with st.expander("Why this result?", expanded=is_phish):
+                if by != "model":
+                    st.write(reason)
+                elif why:
+                    st.write("Signals that raised the phishing score:" if is_phish
                              else "Signals that look like phishing, but not enough to flag this host:")
                     for text, _ in why:
                         st.write(f"- {text}")
@@ -241,17 +332,25 @@ with tab_batch:
         for u in [x.strip() for x in text.splitlines() if x.strip()]:
             host, X, p = score(u, art)
             if not host:
-                rows.append({"input": u, "host": "", "phishing_probability": None,
-                             "prediction": "Invalid input", "borderline": False, "note": "", "main_reasons": ""})
+                rows.append({"input": u, "host": "", "phishing_probability": None, "prediction": "Invalid input",
+                             "decided_by": "", "borderline": False, "note": "", "main_reasons": ""})
                 continue
-            label, borderline = verdict(p, thr)
-            if label != "Phishing":
-                label = "Not flagged as phishing"
-            rows.append({"input": u, "host": host, "phishing_probability": round(p, 4),
-                         "prediction": label, "borderline": borderline,
-                         "note": "has subdomain, may be over-flagged" if subdomain_note(X, label) else "",
-                         "main_reasons": "; ".join(t for t, _ in explain(X, art, p, get_tld(host), top=2))
-                         if label == "Phishing" else ""})
+            is_phish, by, reason, borderline = decide(host, p, thr, art)
+            if is_phish:
+                label = "Phishing"
+            else:
+                label = "Not phishing" if by != "model" else "Not flagged as phishing"
+            note = ""
+            if by == "model" and subdomain_note(X, "Phishing" if is_phish else "Not phishing"):
+                note = "has subdomain, may be over-flagged"
+            if not is_phish and is_shared_platform(host, art):
+                note = "shared platform: check the full link"
+            if is_phish:
+                reasons = reason if by != "model" else "; ".join(t for t, _ in explain(X, art, p, get_tld(host), top=2))
+            else:
+                reasons = ""
+            rows.append({"input": u, "host": host, "phishing_probability": round(p, 4), "prediction": label,
+                         "decided_by": by, "borderline": borderline, "note": note, "main_reasons": reasons})
         out = pd.DataFrame(rows)
         st.dataframe(out, width="stretch")
         st.download_button("Download CSV", out.to_csv(index=False), "predictions.csv", "text/csv")
